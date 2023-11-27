@@ -3,6 +3,7 @@ import itertools
 from tqdm import tqdm
 import functools
 from pathlib import Path
+import openai
 from dotenv import load_dotenv
 import os
 import tiktoken
@@ -19,7 +20,6 @@ import numpy as np
 import time
 
 load_dotenv()
-
 
 def read_files(directory):
     context = ""
@@ -45,12 +45,12 @@ def insert_needle(needle, context, depth_percent, context_length, enc):
     if len(tokens_context) + len(tokens_needle) > context_length:
         tokens_context = tokens_context[:context_length - len(tokens_needle)]
 
-    if depth_percent == 100:
+    if depth_percent >= 1.0:
         # If your depth percent is 100 (which means your needle is the last thing in the doc), throw it at the end
         tokens_new_context = tokens_context + tokens_needle
     else:
         # Go get the position (in terms of tokens) to insert your needle
-        insertion_point = int(len(tokens_context) * (depth_percent / 100))
+        insertion_point = int(len(tokens_context) * depth_percent)
 
         # tokens_new_context represents the tokens before the needle
         tokens_new_context = tokens_context[:insertion_point]
@@ -71,7 +71,7 @@ def insert_needle(needle, context, depth_percent, context_length, enc):
     new_context = enc.decode(tokens_new_context)
     return new_context
 
-def generate_context(needle, context_length, depth_percent):
+def generate_context(needle, context_length, depth_percent, llama_tokenizer):
     # Load up tiktoken so we navigate tokens more easily
     enc = tiktoken.encoding_for_model("gpt-4-1106-preview")
 
@@ -79,10 +79,10 @@ def generate_context(needle, context_length, depth_percent):
     context = read_files("PaulGrahamEssays/*.txt")
 
     # Truncate the Paul Graham essays to the context length you desire
-    context = encode_and_trim(context, context_length, enc)
+    context = encode_and_trim(context, context_length, llama_tokenizer) # USE LLAMA TOKENIZER FOR THIS
 
     # Insert your random statement according to your depth percent
-    context = insert_needle(needle, context, depth_percent, context_length, enc)
+    context = insert_needle(needle, context, depth_percent, context_length, enc) # USE tiktoken as LLAMA doesn't do single period encoding well
 
     return context
 
@@ -132,38 +132,17 @@ def result_exists(results, context_length, depth_percent, version, model):
     return any(conditions_met)
 
 
-class _SentinelTokenStoppingCriteria(transformers.StoppingCriteria):
-
-    def __init__(self, sentinel_token_ids: torch.LongTensor,
-                 starting_idx: int):
-        transformers.StoppingCriteria.__init__(self)
-        self.sentinel_token_ids = sentinel_token_ids
-        self.starting_idx = starting_idx
-
-    def __call__(self, input_ids: torch.LongTensor,
-                 _scores: torch.FloatTensor) -> bool:
-        for sample in input_ids:
-            trimmed_sample = sample[self.starting_idx:]
-            # Can't unfold, output is still too tiny. Skip.
-            if trimmed_sample.shape[-1] < self.sentinel_token_ids.shape[-1]:
-                continue
-
-            for window in trimmed_sample.unfold(
-                    0, self.sentinel_token_ids.shape[-1], 1):
-                if torch.all(torch.eq(self.sentinel_token_ids, window)):
-                    return True
-        return False
-
-
 class Sampler:
     def __init__(self, ckpt_path, device):
         self.ckpt_path = ckpt_path
-        self.model = AutoModelForCausalLM.from_pretrained(ckpt_path, use_flash_attention_2=True, torch_dtype=torch.float16, trust_remote_code=True).to(device)
         self.tokenizer = AutoTokenizer.from_pretrained(ckpt_path, trust_remote_code=True)
         self.tokenizer.add_bos_token = False
-        self.device = device
 
     def __call__(self, context):
+        #openai.api_key = "EMPTY"
+        old_api_base = openai.api_base
+        openai.api_base = "http://localhost:8000/v1"
+
         if 'vicuna' in self.ckpt_path or 'longchat' in self.ckpt_path:
             system_prompt = "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions."
             prompt = f"{system_prompt} USER: {context}\nWhat is the most fun thing to do in San Francisco based on the context? Don't give information outside the document or repeat your findings. Keep your response short and direct. Assistant: "
@@ -176,26 +155,17 @@ class Sampler:
             system_prompt = "You are a helpful assistant."
             prompt = f"{system_prompt} USER: {context}\nWhat is the most fun thing to do in San Francisco based on the context? Don't give information outside the document or repeat your findings. Keep your response short and direct. Assistant: "
 
-        inputs = self.tokenizer(prompt, return_tensors="pt")
-        starting_idx = inputs.input_ids.shape[-1]
-        stopping_criteria_list = transformers.StoppingCriteriaList([
-            _SentinelTokenStoppingCriteria(
-                sentinel_token_ids=self.tokenizer(
-                    "</s>",
-                    add_special_tokens=False,
-                    return_tensors="pt",
-                ).input_ids.to("cuda"),
-                starting_idx=starting_idx)
-        ])
-        output = self.model.generate(
-            inputs.input_ids.to(self.device),
-            do_sample=False,
-            max_new_tokens=250,
-            stopping_criteria=stopping_criteria_list,
-            early_stopping=True
-        )
-        output = output[0, starting_idx:]
-        output = self.tokenizer.decode(output, skip_special_tokens=True)
+        stop = '</s>'
+
+        output = openai.Completion.create(
+            model=os.path.basename(self.ckpt_path),
+            prompt=prompt,
+            max_tokens=250,
+            stop=stop,
+            temperature=0.,
+        ).choices[0].text
+
+        openai.api_base = old_api_base
         return AIMessage(content=output)
 
 
@@ -207,9 +177,11 @@ if __name__ == "__main__":
     parser.add_argument('--min_context', type=int, default=1000)
     parser.add_argument('--num_bins_context', type=int, default=15)
     parser.add_argument('--num_bins_depth', type=int, default=15)
+    parser.add_argument('--dist', type=str, default='linear', choices=['linear', 'sigmoid'])
     parser.add_argument('--rank', type=int, default=0)
     parser.add_argument('--size', type=int, default=1)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--suffix', type=str, default=None)
     parser.add_argument('-o', '--output_folder', type=str, default='results')
     args = parser.parse_args()
 
@@ -230,7 +202,15 @@ if __name__ == "__main__":
 
     # This will product a list of document depths to place your random statement (needle) at.
     # Suggestion: Try out different distributions (like a sigmoid) to test non-evenly space intervals
-    document_depth_percents = np.round(np.linspace(0, 100, num=args.num_bins_depth, endpoint=True)).astype(int)
+    if args.dist == 'linear':
+        document_depth_percents = np.linspace(0, 1.0, num=args.num_bins_depth, endpoint=True)
+    elif args.dist == 'sigmoid':
+        assert args.num_bins_depth % 2 == 1
+        document_depth_percents_half1 = 1 / (1 + np.exp(-np.linspace(-4.5, 0, (args.num_bins_depth - 2) // 2 + 1)))
+        document_depth_percents_half2 = 1 / (1 + np.exp(-np.linspace(0, 4.5, (args.num_bins_depth - 2) // 2 + 1)))[1:]
+        document_depth_percents = np.concatenate(([0], document_depth_percents_half1, document_depth_percents_half2, [1]))
+    else:
+        raise Exception(args.dist)
 
     # The model we are testing. As of now it's set up for chat models with OpenAI
     #model_to_test = ChatOpenAI(model='gpt-4', temperature=0, openai_api_key = os.getenv('OPENAI_API_KEY', 'YourAPIKey'))
@@ -243,13 +223,19 @@ if __name__ == "__main__":
 
     output_folder = Path(args.output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
-    output_file = output_folder / f"{Path(args.ckpt).stem}_{args.rank}.json"
+    fname = f"{Path(args.ckpt).stem}"
+    if args.suffix is not None:
+        fname = f"{fname}_{args.suffix}"
+    fname = f"{fname}_{args.rank}.json"
+    output_file = output_folder / fname
+    print(output_file)
 
     # Run through each iteration of context_lengths and depths
     cfgs = list(itertools.product(document_depth_percents, context_lengths))
     cfgs = np.array_split(cfgs, args.size)[args.rank].tolist()
     for depth_percent, context_length in tqdm(cfgs):
         # Load results from file. 
+        context_length = int(context_length)
         try:
             with output_file.open('r') as f:
                 results = json.load(f)
@@ -263,7 +249,7 @@ if __name__ == "__main__":
             continue
 
         # Go generate the required length context and place your needle statement in
-        context = generate_context(needle, context_length, depth_percent)
+        context = generate_context(needle, context_length, depth_percent, model_to_test.tokenizer)
 
         # Prepare your message to send to the model you're going to evaluate
         #messages = [
@@ -284,7 +270,7 @@ if __name__ == "__main__":
         # Go see if the model can answer the question to pull out your random fact
         response = model_to_test(context)
         if args.no_gpt_4:
-            print(f"Context Length: {context_length}, Depth Percent: {depth_percent}")
+            print(f"Context Length: {context_length}, Depth Percent: {depth_percent * 100:.2f}")
             print(f"Response: {response.content}\nAnswer: {needle}")
             continue
 
@@ -295,7 +281,7 @@ if __name__ == "__main__":
             # 'context' : context, # Uncomment this line if you'd like to save the context the model was asked to retrieve from. Warning: This will become very large.
             'model' : model_to_test_description,
             'context_length' : int(context_length),
-            'depth_percent' : int(depth_percent),
+            'depth_percent' : depth_percent,
             'version' : results_version,
             'needle' : needle,
             'model_response' : response.content,

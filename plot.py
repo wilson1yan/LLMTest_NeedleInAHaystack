@@ -34,5 +34,38 @@ print(context_vals)
 grid = np.zeros((len(depth_vals), len(context_vals)), dtype=np.float32)
 for i in range(len(depth_vals)):
     for j in range(len(context_vals)):
-        grid[i, j] = np.mean(mapping.get((depth_vals[i], context_vals[j]), 0))
-print(grid)
+        grid[i, j] = np.mean(mapping.get((depth_vals[i], context_vals[j]), [0]))
+
+grid = grid / 10
+cmap = plt.cm.get_cmap('viridis')
+fig, ax = plt.subplots(figsize=(10, 6))
+cax = ax.imshow(grid, cmap=cmap, aspect='auto')
+
+cbar = fig.colorbar(cax)
+
+x_ticks = np.arange(grid.shape[1])
+ax.set_xticks(x_ticks)
+ax.set_xticks(x_ticks - 0.5, minor=True)
+xlabels = []
+for c in context_vals:
+    xlabels.append(f"{int(c / 1000)}k")
+ax.set_xticklabels(xlabels, fontsize=8)
+
+y_ticks = np.arange(grid.shape[0])
+ax.set_yticks(y_ticks)
+ax.set_yticks(y_ticks - 0.5, minor=True)
+ylabels = []
+for d in depth_vals:
+    ylabels.append(f"{d*100:.1f}%")
+ax.set_yticklabels(ylabels, fontsize=8)
+
+ax.grid(which='minor', color='lightgray', linestyle='-', linewidth=0.5)
+
+plt.title(args.path_substr)
+plt.xlabel('Context Length')
+plt.ylabel('Document Depth')
+
+plt.savefig('plot.png')
+
+#for row in grid:
+#    print(row.tolist())
