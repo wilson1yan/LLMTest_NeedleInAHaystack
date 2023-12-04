@@ -5,16 +5,10 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-d', '--data_folder', type=str, default='results')
-parser.add_argument('--path_substr', type=str, required=True)
+parser.add_argument('-d', '--data_file', type=str, required=True)
 args = parser.parse_args()
 
-data_folder = Path(args.data_folder)
-data_files = list(data_folder.glob(f"{args.path_substr}*.json"))
-
-data = []
-for data_file in data_files:
-    data.extend(json.load(data_file.open('r')))
+data = json.load(open(args.data_file, 'r'))
 print(len(data))
 
 depth_vals, context_vals = [], []
@@ -61,7 +55,7 @@ ax.set_yticklabels(ylabels, fontsize=8)
 
 ax.grid(which='minor', color='lightgray', linestyle='-', linewidth=0.5)
 
-plt.title(args.path_substr)
+plt.title(Path(args.data_file).stem)
 plt.xlabel('Context Length')
 plt.ylabel('Document Depth')
 

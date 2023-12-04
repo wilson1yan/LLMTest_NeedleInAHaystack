@@ -2,6 +2,7 @@ import argparse
 import itertools
 from tqdm import tqdm
 import functools
+import multiprocessing as mp
 from pathlib import Path
 import openai
 from dotenv import load_dotenv
@@ -13,7 +14,7 @@ import json
 from langchain.evaluation import load_evaluator
 from langchain.chat_models import ChatOpenAI, ChatAnthropic
 from langchain.schema import HumanMessage, SystemMessage, AIMessage
-from transformers import AutoModelForCausalLM, AutoTokenizer #LlamaForCausalLM, LlamaTokenizerFast
+from transformers import AutoModelForCausalLM, AutoTokenizer
 import transformers
 from dotenv import load_dotenv
 import numpy as np
@@ -21,17 +22,18 @@ import time
 
 load_dotenv()
 
+tokens_cache = None
+needle = """
+The best thing to do in San Francisco is eat a sandwich and sit in Dolores Park on a sunny day.
+"""
+question_to_ask = "What is the most fun thing to do in San Francisco?"
+
+
 def read_files(directory):
     context = ""
     for file in glob.glob(directory):
         with open(file, 'r') as f:
             context += f.read()
-    return context
-
-def encode_and_trim(context, context_length, enc):
-    tokens = enc.encode(context)
-    if len(tokens) > context_length:
-        context = enc.decode(tokens[:context_length])
     return context
 
 def insert_needle(needle, context, depth_percent, context_length, enc):
@@ -79,10 +81,15 @@ def generate_context(needle, context_length, depth_percent, llama_tokenizer):
     context = read_files("PaulGrahamEssays/*.txt")
 
     # Truncate the Paul Graham essays to the context length you desire
-    context = encode_and_trim(context, context_length, llama_tokenizer) # USE LLAMA TOKENIZER FOR THIS
+    global tokens_cache # use LlamaTokenizer for this part
+    if tokens_cache is None:
+        tokens_cache= llama_tokenizer.encode(context)
+    context = llama_tokenizer.decode(tokens_cache[:context_length])
 
     # Insert your random statement according to your depth percent
     context = insert_needle(needle, context, depth_percent, context_length, enc) # USE tiktoken as LLAMA doesn't do single period encoding well
+    idx = context.find(needle)
+    print(len(context) / context_length, context_length, idx / len(context), depth_percent)
 
     return context
 
@@ -153,20 +160,58 @@ class Sampler:
             prompt = self.tokenizer.apply_chat_template(messages, tokenize=False)
         else:
             system_prompt = "You are a helpful assistant."
-            prompt = f"{system_prompt} USER: {context}\nWhat is the most fun thing to do in San Francisco based on the context? Don't give information outside the document or repeat your findings. Keep your response short and direct. Assistant: "
+            prompt = f"{system_prompt} USER: {context} What is the most fun thing to do in San Francisco based on the context? Don't give information outside the document or repeat your findings. Keep your response short and direct. Assistant: "
 
         stop = '</s>'
 
-        output = openai.Completion.create(
-            model=os.path.basename(self.ckpt_path),
-            prompt=prompt,
-            max_tokens=250,
-            stop=stop,
-            temperature=0.,
-        ).choices[0].text
+        n_retries = 0
+        while True:
+            try:
+                output = openai.Completion.create(
+                    model=os.path.basename(self.ckpt_path),
+                    prompt=prompt,
+                    max_tokens=250,
+                    stop=stop,
+                    temperature=0.,
+                ).choices[0].text
+                break
+            except:
+                n_retries += 1
+                print(f"retry {n_retries}")
 
         openai.api_base = old_api_base
         return AIMessage(content=output)
+
+
+def eval_example(inp, model_to_test):
+    depth_percent, context_length = inp
+    context_length = int(context_length)
+
+    # Go generate the required length context and place your needle statement in
+    context = generate_context(needle, context_length, depth_percent, model_to_test.tokenizer)
+
+    # Go see if the model can answer the question to pull out your random fact
+    response = model_to_test(context)
+    if args.no_gpt_4:
+        return {
+            'context_length': context_length,
+            'depth_percent': depth_percent,
+            'model_response': response.content,
+            'needle': needle
+        }
+
+    # Compare the reponse to the actual needle you placed
+    score = evaluate_response(response, needle, question_to_ask, evaluation_model)
+
+    return {
+        'model' : model_to_test_description,
+        'context_length' : int(context_length),
+        'depth_percent' : depth_percent,
+        'version' : results_version,
+        'needle' : needle,
+        'model_response' : response.content,
+        'score' : score
+    }
 
 
 if __name__ == "__main__":
@@ -178,30 +223,17 @@ if __name__ == "__main__":
     parser.add_argument('--num_bins_context', type=int, default=15)
     parser.add_argument('--num_bins_depth', type=int, default=15)
     parser.add_argument('--dist', type=str, default='linear', choices=['linear', 'sigmoid'])
-    parser.add_argument('--rank', type=int, default=0)
-    parser.add_argument('--size', type=int, default=1)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--suffix', type=str, default=None)
+    parser.add_argument('--num_workers', type=int, default=16)
     parser.add_argument('-o', '--output_folder', type=str, default='results')
     args = parser.parse_args()
 
     device = torch.device('cuda')
 
-    needle = """
-    The best thing to do in San Francisco is eat a sandwich and sit in Dolores Park on a sunny day.
-    """
-    question_to_ask = "What is the most fun thing to do in San Francisco?"
-
-    # The code will check to see if a context_length, depth percent and version number have already been checked yet
-    # Change the version # if you would like to run the results multiple times.
-    # If you're just testing, then leave as version=1
     results_version = args.seed
-
-    # This will produce a list of context lengths for each experiment iteration. Make sure the max context length is within the bounds of your models limits.
     context_lengths = np.round(np.linspace(args.min_context, args.max_context, num=args.num_bins_context, endpoint=True)).astype(int)
 
-    # This will product a list of document depths to place your random statement (needle) at.
-    # Suggestion: Try out different distributions (like a sigmoid) to test non-evenly space intervals
     if args.dist == 'linear':
         document_depth_percents = np.linspace(0, 1.0, num=args.num_bins_depth, endpoint=True)
     elif args.dist == 'sigmoid':
@@ -212,11 +244,7 @@ if __name__ == "__main__":
     else:
         raise Exception(args.dist)
 
-    # The model we are testing. As of now it's set up for chat models with OpenAI
-    #model_to_test = ChatOpenAI(model='gpt-4', temperature=0, openai_api_key = os.getenv('OPENAI_API_KEY', 'YourAPIKey'))
     model_to_test = Sampler(args.ckpt, device)
-
-    # This will get logged on your results
     model_to_test_description = args.ckpt
 
     evaluation_model  = ChatOpenAI(model="gpt-4", temperature=0, openai_api_key = os.getenv('OPENAI_API_KEY', 'YourAPIKey'))
@@ -226,80 +254,28 @@ if __name__ == "__main__":
     fname = f"{Path(args.ckpt).stem}"
     if args.suffix is not None:
         fname = f"{fname}_{args.suffix}"
-    fname = f"{fname}_{args.rank}.json"
+    fname = f"{fname}.json"
     output_file = output_folder / fname
     print(output_file)
 
-    # Run through each iteration of context_lengths and depths
     cfgs = list(itertools.product(document_depth_percents, context_lengths))
-    cfgs = np.array_split(cfgs, args.size)[args.rank].tolist()
-    for depth_percent, context_length in tqdm(cfgs):
-        # Load results from file. 
-        context_length = int(context_length)
-        try:
-            with output_file.open('r') as f:
-                results = json.load(f)
-        except FileNotFoundError:
-            results = []
-            pass
-
-        # Checks to see if you've already checked a length/percent/version.
-        # This helps if the program stop running and you want to restart later
-        if result_exists(results, context_length, depth_percent, results_version, model_to_test_description):
-            continue
-
-        # Go generate the required length context and place your needle statement in
-        context = generate_context(needle, context_length, depth_percent, model_to_test.tokenizer)
-
-        # Prepare your message to send to the model you're going to evaluate
-        #messages = [
-        #    SystemMessage(
-        #        content="You are a helpful AI bot that answers questions for a user. Keep your response short and direct"
-        #    ),
-        #    HumanMessage(
-        #        # This is the PG essays with your needle/random statement placed in it
-        #        # This is your haystack with a needle placed in it.
-        #        content=context
-        #    ),
-        #    HumanMessage(
-        #        # This is the question you'll ask to the model to tr≠≠y and retrieve your random statement/needle.
-        #        content="What is the most fun thing to do in San Francico based on the context? Don't give information outside the document or repeat your findings"
-        #    ),
-        #]
-
-        # Go see if the model can answer the question to pull out your random fact
-        response = model_to_test(context)
+    if output_file.exists():
+        results = json.load(output_file.open('r'))
+    else:
+        results = []
+    cfgs = [cfg for cfg in cfgs if not result_exists(results, cfg[1], cfg[0], results_version, model_to_test_description)]
+    pool = mp.Pool(args.num_workers)
+    for result in tqdm(pool.imap_unordered(functools.partial(eval_example, model_to_test=model_to_test), cfgs), total=len(cfgs)):
         if args.no_gpt_4:
-            print(f"Context Length: {context_length}, Depth Percent: {depth_percent * 100:.2f}")
-            print(f"Response: {response.content}\nAnswer: {needle}")
+            print(f"Context Length: {result['context_length']}, Depth Percent: {result['depth_percent'] * 100:.2f}%")
+            print(f"Response: {result['model_response']}\nAnswer: {result['needle']}")
             continue
-
-        # Compare the reponse to the actual needle you placed
-        score = evaluate_response(response, needle, question_to_ask, evaluation_model)
-
-        results.append({
-            # 'context' : context, # Uncomment this line if you'd like to save the context the model was asked to retrieve from. Warning: This will become very large.
-            'model' : model_to_test_description,
-            'context_length' : int(context_length),
-            'depth_percent' : depth_percent,
-            'version' : results_version,
-            'needle' : needle,
-            'model_response' : response.content,
-            'score' : score
-        })
-
-        print (f"Result #: {len(results)}/{len(context_lengths) * len(document_depth_percents)}")
-        print (f"Context: {context_length} tokens")
-        print (f"Depth: {depth_percent}%")
-        print (f"Score: {score}")
-        print (f"Response: {response.content}\n")
-
-        # Save results to a JSON file each run
+        print (f"Result #: {len(results)}/{len(cfgs)}")
+        print (f"Context: {result['context_length']} tokens")
+        print (f"Depth: {result['depth_percent'] * 100:.2f}%")
+        print (f"Score: {result['score']}")
+        print (f"Response: {result['model_response']}\n")
+        results.append(result)
         with output_file.open('w') as f:
             json.dump(results, f)
-
-        # Optional. Sleep for a bit to stay under the rate limit
-        # Rate limit is 150K tokens/min so it's set at 120K for some cushion
-        #sleep_time = (context_length / 120000)*60
-        # print (f"Sleeping: {sleep_time}\n")
-        #time.sleep(sleep_time)
+    print('done')
