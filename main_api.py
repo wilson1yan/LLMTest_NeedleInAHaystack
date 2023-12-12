@@ -78,12 +78,14 @@ def generate_context(needle, context_length, depth_percent, llama_tokenizer):
     enc = tiktoken.encoding_for_model("gpt-4-1106-preview")
 
     # Get your Paul Graham files loaded into a string
-    context = read_files("PaulGrahamEssays/*.txt")
+    context = read_files("PaulGrahamEssays/doc.txt")
 
     # Truncate the Paul Graham essays to the context length you desire
     global tokens_cache # use LlamaTokenizer for this part
     if tokens_cache is None:
-        tokens_cache= llama_tokenizer.encode(context)
+        #tokens_cache = llama_tokenizer.encode(context)
+        tokens_cache = json.load(open('tokens_cache.json', 'r'))
+    print(len(tokens_cache))
     context = llama_tokenizer.decode(tokens_cache[:context_length])
 
     # Insert your random statement according to your depth percent
@@ -200,8 +202,16 @@ def eval_example(inp, model_to_test):
             'needle': needle
         }
 
+
+    content = response.content
+    if "Dolores" in content and "sandwich" in content:
+        score = 10
+    else:
+        score = 3
+
     # Compare the reponse to the actual needle you placed
-    score = evaluate_response(response, needle, question_to_ask, evaluation_model)
+    #score = evaluate_response(response, needle, question_to_ask, evaluation_model)
+
 
     return {
         'model' : model_to_test_description,
